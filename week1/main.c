@@ -1,31 +1,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "STUNExternalIP.h"
+#include "STUNExternalIP.h" // STUNExternalIP 헤더 파일 포함
 
-int main(int argc, const char * argv[]) {
-    struct STUNServer servers[14] = {
-        {"stun.l.google.com", 19302}, {"stun.l.google.com", 19305},
-        {"stun1.l.google.com", 19302}, {"stun1.l.google.com", 19305},
-        {"stun2.l.google.com", 19302}, {"stun2.l.google.com", 19305},
-        {"stun3.l.google.com", 19302}, {"stun3.l.google.com", 19305},
-        {"stun4.l.google.com", 19302}, {"stun4.l.google.com", 19305},
-        {"stun.wtfismyip.com", 3478}, {"stun.bcs2005.net", 3478},
-        {"numb.viagenie.ca", 3478}, {"173.194.202.127", 19302}
-    };
-
-    for (int index = 0; index < 14; index++) {
-        char address[100];
-        unsigned short port;
-        struct STUNServer server = servers[index];
-
-        int retVal = getPublicIPAddressAndPort(server, address, &port);
-
-        if (retVal != 0) {
-            printf("%s: Failed. Error: %d\n", server.address, retVal);
-        } else {
-            printf("%s: Public IP: %s, Public Port: %d\n", server.address, address, port);
-        }
+int main() {
+    // 사용할 STUN 서버 설정 (하나의 서버만 사용)
+    struct STUNServer server = {"stun.l.google.com", 19302};
+    
+    // 공인 IP 주소와 포트를 저장할 변수
+    char address[100];
+    unsigned short port;
+    
+    // 공인 IP 주소 및 포트 요청
+    int retVal = getPublicIPAddressAndPort(server, address, &port);
+    
+    // 결과 출력
+    if (retVal != 0) {
+        // 요청이 실패한 경우 에러 메시지 출력
+        printf("Failed to retrieve public IP and port from %s. Error: %d\n", server.address, retVal);
+    } else {
+        // 성공적으로 공인 IP와 포트를 가져온 경우 출력
+        printf("Public IP: %s, Public Port: %d\n", address, port);
     }
-    return 0;
+    
+    return 0; // 프로그램 종료
 }
