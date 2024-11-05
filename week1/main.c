@@ -21,7 +21,7 @@ int main() {
         }
 
         // 30초 대기 후 STUN 요청 반복
-        sleep(30);
+        sleep(10);
     }
 
     return 0;
