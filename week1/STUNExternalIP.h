@@ -1,3 +1,13 @@
+//
+//  STUNExternalIP.h
+//  STUNExternalIP
+//
+//  Created by FireWolf on 2016-11-16.
+//  Revised by FireWolf on 2017-02-24.
+//
+//  Copyright © 2017 FireWolf. All rights reserved.
+//
+
 #ifndef STUNExternalIP_h
 #define STUNExternalIP_h
 
@@ -24,3 +34,4 @@ struct STUNServer {
 int getPublicIPAddressAndPort(struct STUNServer server, char* address, unsigned short* port);
 
 #endif /* STUNExternalIP_h */
+
