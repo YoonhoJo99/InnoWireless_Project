@@ -1,85 +1,82 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
-#pragma comment(lib, "ws2_32.lib")
+#define BUFFER_SIZE 1024
 
 int main(int argc, char *argv[]) {
-    WSADATA wsaData;
-    SOCKET listenSocket, clientSocket;
+    int serverSocket, clientSocket;
     struct sockaddr_in serverAddr, clientAddr;
-    int clientAddrSize = sizeof(clientAddr);
-    
+    char buffer[BUFFER_SIZE];
+    socklen_t addr_size;
+    int port;
+
     // 포트 번호 입력 확인
     if (argc != 2) {
         printf("Usage: %s <port>\n", argv[0]);
         return 1;
     }
-    int port = atoi(argv[1]);
+    port = atoi(argv[1]);
 
-    // 윈속 초기화
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        printf("WSAStartup failed: %d\n", WSAGetLastError());
-        return 1;
-    }
-
-    // TCP 소켓 생성
-    listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSocket == INVALID_SOCKET) {
-        printf("Socket creation failed: %d\n", WSAGetLastError());
-        WSACleanup();
+    // 서버 소켓 생성
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        perror("Socket creation failed");
         return 1;
     }
 
     // 서버 주소 설정
     memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;  // 모든 인터페이스에 바인딩
-    serverAddr.sin_port = htons(port); // 입력받은 포트 번호로 설정
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(port);
 
     // 소켓 바인딩
-    if (bind(listenSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        printf("Socket binding failed: %d\n", WSAGetLastError());
-        closesocket(listenSocket);
-        WSACleanup();
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        perror("Bind failed");
+        close(serverSocket);
         return 1;
     }
 
-    // 리슨 상태로 전환
-    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
-        printf("Listen failed: %d\n", WSAGetLastError());
-        closesocket(listenSocket);
-        WSACleanup();
+    // 연결 대기
+    if (listen(serverSocket, 5) < 0) {
+        perror("Listen failed");
+        close(serverSocket);
         return 1;
     }
-
     printf("Listening on port %d...\n", port);
 
-    // 클라이언트 연결 대기
-    clientSocket = accept(listenSocket, (struct sockaddr*)&clientAddr, &clientAddrSize);
-    if (clientSocket == INVALID_SOCKET) {
-        printf("Accept failed: %d\n", WSAGetLastError());
-        closesocket(listenSocket);
-        WSACleanup();
+    // 클라이언트 연결 수락
+    addr_size = sizeof(clientAddr);
+    clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &addr_size);
+    if (clientSocket < 0) {
+        perror("Accept failed");
+        close(serverSocket);
         return 1;
     }
+    printf("Client connected.\n");
 
-    // 연결 성공 시 클라이언트 IP와 포트 출력
-    char clientIP[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, sizeof(clientIP));
-    printf("Connected to client: %s:%d\n", clientIP, ntohs(clientAddr.sin_port));
+    // 데이터 송수신 루프
+    while (1) {
+        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        if (bytesReceived <= 0) {
+            printf("Client disconnected or error occurred.\n");
+            break;
+        }
+        buffer[bytesReceived] = '\0';
+        printf("Received from client: %s\n", buffer);
 
-    // 클라이언트에게 간단한 응답 보내기 (테스트용)
-    const char* message = "Hello from TCP Server!";
-    send(clientSocket, message, strlen(message), 0);
+        // 클라이언트에게 응답
+        send(clientSocket, buffer, bytesReceived, 0);
+    }
 
-    // 연결 종료
-    closesocket(clientSocket);
-    closesocket(listenSocket);
-    WSACleanup();
-
+    // 소켓 종료
+    close(clientSocket);
+    close(serverSocket);
     return 0;
 }
 
