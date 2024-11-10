@@ -4,48 +4,54 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <errno.h>
 #include "STUNExternalIP.h"
 
 #define BUFFER_SIZE 1024
 
 int main() {
+    printf("[LOG] Client A 시작...\n");
+    
     struct STUNServer server = {"stun.l.google.com", 19302};
     char public_ip[100];
     unsigned short public_port;
     
-    // 공인 IP와 포트 얻기
+    printf("[LOG] STUN 서버에 요청 중...\n");
     int ret = getPublicIPAddressAndPort(server, public_ip, &public_port);
     if (ret != 0) {
-        printf("Failed to get public IP and port. Error: %d\n", ret);
+        printf("[ERROR] STUN 서버 응답 실패. Error: %d\n", ret);
         return 1;
     }
+    printf("[LOG] STUN 서버 응답 성공!\n");
     
     printf("Client A Public IP: %s, Port: %d\n", public_ip, public_port);
     
-    // UDP 소켓 생성
+    printf("[LOG] UDP 소켓 생성 중...\n");
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        perror("Socket creation failed");
+        printf("[ERROR] 소켓 생성 실패: %s\n", strerror(errno));
         return 1;
     }
+    printf("[LOG] 소켓 생성 성공. socket_fd: %d\n", sock);
     
-    // 로컬 주소 바인딩
     struct sockaddr_in local_addr;
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
     local_addr.sin_addr.s_addr = INADDR_ANY;
     local_addr.sin_port = htons(public_port);
     
+    printf("[LOG] 소켓 바인딩 중...\n");
     if (bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
-        perror("Bind failed");
+        printf("[ERROR] 바인드 실패: %s\n", strerror(errno));
         return 1;
     }
+    printf("[LOG] 소켓 바인딩 성공\n");
     
-    // Client B의 정보 입력 받기
     char client_b_ip[100];
     int client_b_port;
     printf("Client B의 IP와 Port를 입력하시오.\n>>>");
     scanf("%s %d", client_b_ip, &client_b_port);
+    printf("[LOG] Client B 정보 입력 완료 - IP: %s, Port: %d\n", client_b_ip, client_b_port);
     
     struct sockaddr_in client_b_addr;
     memset(&client_b_addr, 0, sizeof(client_b_addr));
@@ -59,16 +65,50 @@ int main() {
     fgets(message, BUFFER_SIZE, stdin);
     message[strlen(message)-1] = '\0'; // 개행문자 제거
     
-    // Client B에게 메시지 전송
-    sendto(sock, message, strlen(message), 0,
+    printf("[LOG] 메시지 전송 시도 중... (메시지: %s)\n", message);
+    ssize_t sent_bytes = sendto(sock, message, strlen(message), 0,
            (struct sockaddr*)&client_b_addr, sizeof(client_b_addr));
     
-    // NAT 바인딩 유지를 위한 주기적인 메시지 전송
+    if (sent_bytes < 0) {
+        printf("[ERROR] 메시지 전송 실패: %s\n", strerror(errno));
+    } else {
+        printf("[LOG] 메시지 전송 성공! (%zd bytes)\n", sent_bytes);
+    }
+    
+    printf("[LOG] 응답 대기 중...\n");
+    
+    // 응답 대기 추가
+    char recv_buffer[BUFFER_SIZE];
+    struct sockaddr_in from_addr;
+    socklen_t from_len = sizeof(from_addr);
+    
+    // 5초 타임아웃 설정
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    ssize_t recv_len = recvfrom(sock, recv_buffer, BUFFER_SIZE, 0,
+                               (struct sockaddr*)&from_addr, &from_len);
+    
+    if (recv_len < 0) {
+        printf("[ERROR] 응답 수신 실패: %s\n", strerror(errno));
+    } else {
+        recv_buffer[recv_len] = '\0';
+        printf("[LOG] 응답 수신 성공! (%zd bytes): %s\n", recv_len, recv_buffer);
+    }
+    
+    printf("[LOG] NAT 바인딩 유지를 위한 루프 시작...\n");
     while (1) {
-        // 30초마다 keep-alive 메시지 전송
+        printf("[LOG] Keep-alive 메시지 전송 중...\n");
         sleep(30);
-        sendto(sock, "keep-alive", 10, 0,
-               (struct sockaddr*)&client_b_addr, sizeof(client_b_addr));
+        sent_bytes = sendto(sock, "keep-alive", 10, 0,
+                          (struct sockaddr*)&client_b_addr, sizeof(client_b_addr));
+        if (sent_bytes < 0) {
+            printf("[ERROR] Keep-alive 전송 실패: %s\n", strerror(errno));
+        } else {
+            printf("[LOG] Keep-alive 전송 성공 (%zd bytes)\n", sent_bytes);
+        }
     }
     
     close(sock);
