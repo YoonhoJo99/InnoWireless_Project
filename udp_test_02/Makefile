@@ -1,47 +1,34 @@
+# Compiler
 CC = gcc
-CFLAGS = -Wall -Wextra
-LDFLAGS = 
-INCLUDES = -I.
 
-# 실행 파일 이름
-TARGETS = client_A client_B
+# Compiler flags
+CFLAGS = -Wall -g
 
-# 소스 파일들
-SRCS_A = client_A.c STUNExternalIP.c
-SRCS_B = client_B.c STUNExternalIP.c
+# Executable name
+TARGET = client
 
-# Object 파일들
-OBJS_A = $(SRCS_A:.c=.o)
-OBJS_B = $(SRCS_B:.c=.o)
+# Source files
+SRCS = main.c STUNExternalIP.c
 
-# 기본 타겟
-all: $(TARGETS)
+# Object files (replace .c with .o)
+OBJS = $(SRCS:.c=.o)
 
-# Client A 빌드 룰
-client_A: $(OBJS_A)
-	$(CC) $(OBJS_A) -o $@ $(LDFLAGS)
+# Default target
+all: $(TARGET)
 
-# Client B 빌드 룰
-client_B: $(OBJS_B)
-	$(CC) $(OBJS_B) -o $@ $(LDFLAGS)
+# Build the executable
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
 
-# Object 파일 빌드 룰
+# Compile .c files to .o
 %.o: %.c
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# clean 타겟
+# Clean up build files
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f $(OBJS) $(TARGET)
 
-# 의존성 파일 포함
--include $(SRCS_A:.c=.d)
--include $(SRCS_B:.c=.d)
+# Run the program
+run: $(TARGET)
+	./$(TARGET)
 
-# 헤더 파일 의존성 생성
-%.d: %.c
-	@set -e; rm -f $@; \
-	$(CC) -MM $(INCLUDES) $< > $@.$$$$; \
-	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@; \
-	rm -f $@.$$$$
-
-.PHONY: all clean
