@@ -77,31 +77,42 @@ int main() {
     
     printf("[LOG] 응답 대기 중...\n");
     
-    // 응답 대기 추가
+    // 응답 대기 추가 (재시도 로직 포함)
     char recv_buffer[BUFFER_SIZE];
     struct sockaddr_in from_addr;
     socklen_t from_len = sizeof(from_addr);
     
-    // 5초 타임아웃 설정
-    struct timeval tv;
-    tv.tv_sec = 5;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int retry_count = 0;
+    int max_retries = 5;
     
-    ssize_t recv_len = recvfrom(sock, recv_buffer, BUFFER_SIZE, 0,
-                               (struct sockaddr*)&from_addr, &from_len);
-    
-    if (recv_len < 0) {
-        printf("[ERROR] 응답 수신 실패: %s\n", strerror(errno));
-    } else {
+    while (retry_count < max_retries) {
+        ssize_t recv_len = recvfrom(sock, recv_buffer, BUFFER_SIZE, 0,
+                                    (struct sockaddr*)&from_addr, &from_len);
+        
+        if (recv_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                printf("[ERROR] 응답 수신 실패: 타임아웃. 재시도 중... (%d/%d)\n", retry_count + 1, max_retries);
+                retry_count++;
+                continue;
+            } else {
+                printf("[ERROR] 응답 수신 실패: %s\n", strerror(errno));
+                break;
+            }
+        }
+        
         recv_buffer[recv_len] = '\0';
         printf("[LOG] 응답 수신 성공! (%zd bytes): %s\n", recv_len, recv_buffer);
+        break;
+    }
+    
+    if (retry_count == max_retries) {
+        printf("[ERROR] 응답 수신 실패: 재시도 횟수 초과\n");
     }
     
     printf("[LOG] NAT 바인딩 유지를 위한 루프 시작...\n");
     while (1) {
         printf("[LOG] Keep-alive 메시지 전송 중...\n");
-        sleep(30);
+        sleep(10); // Keep-alive 메시지 간격 10초로 변경
         sent_bytes = sendto(sock, "keep-alive", 10, 0,
                           (struct sockaddr*)&client_b_addr, sizeof(client_b_addr));
         if (sent_bytes < 0) {
@@ -114,3 +125,4 @@ int main() {
     close(sock);
     return 0;
 }
+
