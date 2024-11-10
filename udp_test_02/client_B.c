@@ -2,71 +2,75 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include "STUNExternalIP.h"
 
-void receiveMessageFromClientA(int socketd, struct sockaddr_in* clientA_address) {
-    char buffer[512];
-    socklen_t address_len = sizeof(*clientA_address);
-
-    ssize_t length = recvfrom(socketd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr*)clientA_address, &address_len);
-    if (length < 0) {
-        perror("Receive failed");
-        return;
-    }
-
-    buffer[length] = '\0'; // Null-terminate the received message
-    printf("Client A가 보낸 '%s'를 받았습니다.\n", buffer);
-
-    // Send confirmation back to Client A
-    const char* confirmation_message = "Message received successfully by Client B!";
-    if (sendto(socketd, confirmation_message, strlen(confirmation_message), 0, (struct sockaddr*)clientA_address, sizeof(*clientA_address)) == -1) {
-        perror("Send confirmation failed");
-    } else {
-        printf("Confirmation sent back to Client A: '%s'\n", confirmation_message);
-    }
-}
+#define BUFFER_SIZE 1024
 
 int main() {
-    char clientA_ip[100];
-    unsigned short clientA_port;
-    int socketd;
-    struct sockaddr_in clientB_address;
-
-    // Retrieve Client B's public IP and port (from previous STUN logic)
+    struct STUNServer server = {"stun.l.google.com", 19302};
+    char public_ip[100];
+    unsigned short public_port;
     
-    printf("Client A의 IP와 Port를 입력하시오: ");
-    scanf("%s %hu", clientA_ip, &clientA_port);  // Input Client A's IP and Port
-
-    // Create a socket to receive messages
-    socketd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (socketd < 0) {
+    // 공인 IP와 포트 얻기
+    int ret = getPublicIPAddressAndPort(server, public_ip, &public_port);
+    if (ret != 0) {
+        printf("Failed to get public IP and port. Error: %d\n", ret);
+        return 1;
+    }
+    
+    printf("Client B Public IP: %s, Port: %d\n", public_ip, public_port);
+    
+    // UDP 소켓 생성
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
         perror("Socket creation failed");
-        return -1;
+        return 1;
     }
-
-    // Setup the local address for Client B
-    bzero(&clientB_address, sizeof(clientB_address));
-    clientB_address.sin_family = AF_INET;
-    clientB_address.sin_port = htons(clientA_port);  // Use Client A's port to receive messages
-    if (inet_pton(AF_INET, clientA_ip, &clientB_address.sin_addr) <= 0) {
-        perror("Invalid address");
-        close(socketd);
-        return -1;
-    }
-
-    // Bind the socket to listen for messages from Client A
-    if (bind(socketd, (struct sockaddr*)&clientB_address, sizeof(clientB_address)) < 0) {
+    
+    // 로컬 주소 바인딩
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port = htons(public_port);
+    
+    if (bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
         perror("Bind failed");
-        close(socketd);
-        return -1;
+        return 1;
     }
-
-    // Receive the message from Client A
-    receiveMessageFromClientA(socketd, &clientB_address);
-
-    // Close the socket
-    close(socketd);
+    
+    // Client A의 정보 입력 받기
+    char client_a_ip[100];
+    int client_a_port;
+    printf("Client A의 IP와 Port를 입력하시오.\n>>>");
+    scanf("%s %d", client_a_ip, &client_a_port);
+    
+    struct sockaddr_in client_a_addr;
+    memset(&client_a_addr, 0, sizeof(client_a_addr));
+    client_a_addr.sin_family = AF_INET;
+    client_a_addr.sin_addr.s_addr = inet_addr(client_a_ip);
+    client_a_addr.sin_port = htons(client_a_port);
+    
+    // Client A로부터 메시지 수신
+    char buffer[BUFFER_SIZE];
+    socklen_t addr_len = sizeof(client_a_addr);
+    
+    while (1) {
+        int recv_len = recvfrom(sock, buffer, BUFFER_SIZE, 0,
+                               (struct sockaddr*)&client_a_addr, &addr_len);
+        if (recv_len > 0) {
+            buffer[recv_len] = '\0';
+            if (strcmp(buffer, "keep-alive") != 0) {
+                printf("ClientA가 보낸 '%s'를 받았습니다.\n", buffer);
+            }
+            // Client A에게 응답 (NAT 바인딩 유지를 위해)
+            sendto(sock, "received", 8, 0,
+                   (struct sockaddr*)&client_a_addr, sizeof(client_a_addr));
+        }
+    }
+    
+    close(sock);
     return 0;
 }
-
