@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,28 +6,19 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <netdb.h>
 #include <errno.h>
 #include <time.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <pthread.h>
+#include <sys/wait.h>
 
-// Constants for STUN and NAT traversal
 #define GOOGLE_STUN_SERVER "stun.l.google.com"
 #define GOOGLE_STUN_PORT 19302
 #define BUFFER_SIZE 1024
 #define PUNCH_INTERVAL_MS 500
 #define PUNCH_TIMEOUT_SEC 60
 #define KEEPALIVE_INTERVAL 5
-
-// Constants for speed test
-#define SPEED_TEST_PORT_OFFSET 1
-#define CHUNK_SIZE (64 * 1024)
-#define TEST_DURATION 10
-#define SPEED_TEST_COMMAND "SPEED_TEST"
-#define TCP_BUFFER_SIZE (256 * 1024)
 
 // STUN Message Types
 #define STUN_BINDING_REQUEST 0x0001
@@ -36,6 +28,13 @@
 // STUN Attribute Types
 #define MAPPED_ADDRESS 0x0001
 #define XOR_MAPPED_ADDRESS 0x0020
+
+// iperf 관련 상수 추가
+#define IPERF_PORT 5201
+#define IPERF_DURATION 10
+#define IPERF_SERVER "iperf3 -s -p %d"
+#define IPERF_CLIENT "iperf3 -c %s -p %d -t %d -J"
+#define IPERF_RESULT_BUFFER 4096
 
 #pragma pack(push, 1)
 struct stun_header {
@@ -63,24 +62,6 @@ typedef struct {
     uint16_t public_port;
 } PublicEndpoint;
 
-typedef struct {
-    double duration;
-    double bytes;
-    double speed_mbps;
-} SpeedTestResult;
-
-// Function declarations
-void generate_transaction_id(uint8_t *transaction_id);
-int create_stun_binding_request(uint8_t *buffer);
-int parse_stun_response(uint8_t *response, int response_len, PublicEndpoint *endpoint);
-int get_public_endpoint(int sock, PublicEndpoint *endpoint);
-int perform_nat_punching(int sock, struct sockaddr_in *peer_addr);
-void send_keepalive(int sock, struct sockaddr_in *peer_addr);
-int create_tcp_socket(int port, int is_server);
-void* run_speed_test_server(void* arg);
-SpeedTestResult run_speed_test_client(const char* server_ip, int port);
-
-// Implementation of functions
 void generate_transaction_id(uint8_t *transaction_id) {
     for (int i = 0; i < 12; i++) {
         transaction_id[i] = rand() % 256;
@@ -89,10 +70,12 @@ void generate_transaction_id(uint8_t *transaction_id) {
 
 int create_stun_binding_request(uint8_t *buffer) {
     struct stun_header *header = (struct stun_header *)buffer;
+    
     header->type = htons(STUN_BINDING_REQUEST);
     header->length = htons(0);
     header->magic_cookie = htonl(STUN_MAGIC_COOKIE);
     generate_transaction_id(header->transaction_id);
+    
     return sizeof(struct stun_header);
 }
 
@@ -127,6 +110,7 @@ int parse_stun_response(uint8_t *response, int response_len, PublicEndpoint *end
             ptr += 4 - (attr_length % 4);
         }
     }
+    
     return -1;
 }
 
@@ -224,122 +208,79 @@ int perform_nat_punching(int sock, struct sockaddr_in *peer_addr) {
     return -1;
 }
 
-int create_tcp_socket(int port, int is_server) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("TCP socket creation failed");
-        return -1;
-    }
-
-    int buffer_size = TCP_BUFFER_SIZE;
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
-
-    int flag = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-    if (is_server) {
-        struct sockaddr_in server_addr;
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = INADDR_ANY;
-        server_addr.sin_port = htons(port);
-
-        if (bind(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            perror("TCP bind failed");
-            close(sock);
-            return -1;
-        }
-
-        if (listen(sock, 1) < 0) {
-            perror("Listen failed");
-            close(sock);
-            return -1;
-        }
-    }
-
-    return sock;
-}
-
-void* run_speed_test_server(void* arg) {
-    int port = *(int*)arg;
-    int server_sock = create_tcp_socket(port, 1);
-    if (server_sock < 0) return NULL;
-
-    printf("Speed test server listening on port %d\n", port);
-
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    int client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addr_len);
+// iperf 실행 및 결과 파싱을 위한 함수들
+void start_iperf_server(int port) {
+    char command[256];
+    snprintf(command, sizeof(command), IPERF_SERVER, port);
     
-    if (client_sock < 0) {
-        perror("Accept failed");
-        close(server_sock);
-        return NULL;
-    }
-
-    char buffer[CHUNK_SIZE];
-    size_t total_received = 0;
-    time_t start_time = time(NULL);
-    
-    while (1) {
-        ssize_t received = recv(client_sock, buffer, sizeof(buffer), 0);
-        if (received <= 0) break;
-        total_received += received;
+    pid_t pid = fork();
+    if (pid == 0) {  // 자식 프로세스
+        // 표준 출력을 /dev/null로 리다이렉트
+        int devnull = open("/dev/null", O_WRONLY);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
         
-        if (time(NULL) - start_time >= TEST_DURATION) break;
+        // iperf 서버 실행
+        system(command);
+        exit(0);
     }
-
-    double duration = difftime(time(NULL), start_time);
-    double speed_mbps = (total_received * 8.0) / (duration * 1000000.0);
-    
-    SpeedTestResult result = {
-        .duration = duration,
-        .bytes = total_received,
-        .speed_mbps = speed_mbps
-    };
-    send(client_sock, &result, sizeof(result), 0);
-
-    printf("Speed test completed. Received %.2f MB at %.2f Mbps\n",
-           total_received / (1024.0 * 1024.0), speed_mbps);
-
-    close(client_sock);
-    close(server_sock);
-    return NULL;
 }
 
-SpeedTestResult run_speed_test_client(const char* server_ip, int port) {
-    SpeedTestResult result = {0};
-    int sock = create_tcp_socket(0, 0);
-    if (sock < 0) return result;
+void stop_iperf_server() {
+    system("pkill -f 'iperf3 -s'");
+}
 
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr(server_ip);
-    server_addr.sin_port = htons(port);
-
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connect failed");
-        close(sock);
-        return result;
-    }
-
-    char buffer[CHUNK_SIZE];
-    memset(buffer, 'X', sizeof(buffer));
+void parse_iperf_result(const char* result) {
+    char *sender_ptr = strstr(result, "\"sender\"");
+    char *receiver_ptr = strstr(result, "\"receiver\"");
     
-    size_t total_sent = 0;
-    time_t start_time = time(NULL);
-    
-    while (difftime(time(NULL), start_time) < TEST_DURATION) {
-        ssize_t sent = send(sock, buffer, sizeof(buffer), 0);
-        if (sent < 0) break;
-        total_sent += sent;
+    if (sender_ptr && receiver_ptr) {
+        char *bits_per_second_sender = strstr(sender_ptr, "\"bits_per_second\":");
+        char *bits_per_second_receiver = strstr(receiver_ptr, "\"bits_per_second\":");
+        
+        if (bits_per_second_sender && bits_per_second_receiver) {
+            double sender_bps, receiver_bps;
+            sscanf(bits_per_second_sender + 18, "%lf", &sender_bps);
+            sscanf(bits_per_second_receiver + 18, "%lf", &receiver_bps);
+            
+            printf("\nSpeed Test Results:\n");
+            printf("Sender: %.2f Mbps\n", sender_bps / 1000000.0);
+            printf("Receiver: %.2f Mbps\n", receiver_bps / 1000000.0);
+        }
     }
+}
 
-    recv(sock, &result, sizeof(result), 0);
-    close(sock);
-    return result;
+void perform_iperf_test(const char* peer_ip, int port, int is_server) {
+    char command[256];
+    char result[IPERF_RESULT_BUFFER];
+    FILE *fp;
+    
+    if (is_server) {
+        printf("Starting iperf server...\n");
+        start_iperf_server(port);
+        sleep(2);  // 서버가 시작될 때까지 대기
+    } else {
+        printf("Running iperf client test...\n");
+        snprintf(command, sizeof(command), IPERF_CLIENT, peer_ip, port, IPERF_DURATION);
+        
+        fp = popen(command, "r");
+        if (fp == NULL) {
+            printf("Failed to run iperf client\n");
+            return;
+        }
+        
+        size_t total_read = 0;
+        size_t bytes_read;
+        while ((bytes_read = fread(result + total_read, 1, 
+               IPERF_RESULT_BUFFER - total_read - 1, fp)) > 0) {
+            total_read += bytes_read;
+        }
+        result[total_read] = '\0';
+        
+        pclose(fp);
+        parse_iperf_result(result);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -400,50 +341,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("\nP2P connection established. Commands:\n");
-    printf("1. Start chat\n");
-    printf("2. Run speed test\n");
-    printf("Choice: ");
-
-    int choice;
-    scanf("%d", &choice);
-    getchar(); // 버퍼 비우기
-
-    if (choice == 2) {
-        // 상대방에게 속도 테스트 시작을 알림
-        sendto(sock, SPEED_TEST_COMMAND, strlen(SPEED_TEST_COMMAND), 0,
-               (struct sockaddr*)&peer_addr, sizeof(peer_addr));
-
-        // TCP 포트는 UDP 포트 + 1 사용
-        int tcp_port = ntohs(local_addr.sin_port) + SPEED_TEST_PORT_OFFSET;
-        
-        // 서버 스레드 시작
-        pthread_t server_thread;
-        pthread_create(&server_thread, NULL, run_speed_test_server, &tcp_port);
-
-        // 잠시 대기 후 클라이언트 시작
-        sleep(1);
-        
-        // 클라이언트로 속도 테스트 실행
-        printf("Starting speed test...\n");
-        SpeedTestResult result = run_speed_test_client(peer_ip, 
-                                                     ntohs(peer_addr.sin_port) + SPEED_TEST_PORT_OFFSET);
-        
-        printf("\nSpeed Test Results:\n");
-        printf("Duration: %.2f seconds\n", result.duration);
-        printf("Total Data: %.2f MB\n", result.bytes / (1024.0 * 1024.0));
-        printf("Speed: %.2f Mbps\n", result.speed_mbps);
-
-        pthread_join(server_thread, NULL);
-        return 0;
-    }
-
-    // 채팅 모드
     printf("P2P connection established. Starting chat...\n");
+    printf("Commands:\n");
+    printf("  /iperf server - Start iperf server\n");
+    printf("  /iperf client - Start iperf client test\n");
+    printf("  /quit - Exit the program\n");
 
     fd_set readfds;
     struct timeval tv;
     time_t last_activity = time(NULL);
+    int iperf_server_running = 0;
     
     while (1) {
         FD_ZERO(&readfds);
@@ -466,6 +373,24 @@ int main(int argc, char *argv[]) {
             memset(buffer, 0, BUFFER_SIZE);
             fgets(buffer, BUFFER_SIZE, stdin);
 
+            // 명령어 처리
+            if (strncmp(buffer, "/iperf server", 12) == 0) {
+                perform_iperf_test(NULL, IPERF_PORT, 1);
+                iperf_server_running = 1;
+                printf("Iperf server started on port %d\n", IPERF_PORT);
+                continue;
+            }
+            else if (strncmp(buffer, "/iperf client", 12) == 0) {
+                perform_iperf_test(peer_ip, IPERF_PORT, 0);
+                continue;
+            }
+            else if (strncmp(buffer, "/quit", 5) == 0) {
+                if (iperf_server_running) {
+                    stop_iperf_server();
+                }
+                break;
+            }
+
             if (sendto(sock, buffer, strlen(buffer), 0,
                       (struct sockaddr*)&peer_addr, sizeof(peer_addr)) < 0) {
                 perror("Send failed");
@@ -485,30 +410,22 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // 속도 테스트 명령 확인
-            if (strcmp(buffer, SPEED_TEST_COMMAND) == 0) {
-                printf("Received speed test request\n");
-                int tcp_port = ntohs(local_addr.sin_port) + SPEED_TEST_PORT_OFFSET;
-                pthread_t server_thread;
-                pthread_create(&server_thread, NULL, run_speed_test_server, &tcp_port);
-                pthread_detach(server_thread);
-                continue;
-            }
-
             if (strcmp(buffer, "KEEPALIVE") != 0) {
                 printf("Peer: %s", buffer);
                 last_activity = current_time;
             }
         }
 
-        // Keepalive 전송
         if (current_time - last_activity >= KEEPALIVE_INTERVAL) {
             send_keepalive(sock, &peer_addr);
             last_activity = current_time;
         }
     }
 
+    if (iperf_server_running) {
+        stop_iperf_server();
+    }
+    
     close(sock);
     return 0;
 }
-
