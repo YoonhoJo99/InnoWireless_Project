@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +10,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <sys/wait.h>
+#include <sys/time.h>
 
 #define GOOGLE_STUN_SERVER "stun.l.google.com"
 #define GOOGLE_STUN_PORT 19302
@@ -29,12 +28,10 @@
 #define MAPPED_ADDRESS 0x0001
 #define XOR_MAPPED_ADDRESS 0x0020
 
-// iperf 관련 상수 추가
-#define IPERF_PORT 5201
-#define IPERF_DURATION 10
-#define IPERF_SERVER "iperf3 -s -p %d"
-#define IPERF_CLIENT "iperf3 -c %s -p %d -t %d -J"
-#define IPERF_RESULT_BUFFER 4096
+// Iperf style definitions
+#define IPERF_PACKET_SIZE 8192  // Default packet size
+#define TEST_DURATION 10        // Default test duration (seconds)
+#define REPORT_INTERVAL 1       // Status report interval (seconds)
 
 #pragma pack(push, 1)
 struct stun_header {
@@ -55,12 +52,28 @@ struct xor_mapped_address {
     uint16_t port;
     uint32_t address;
 };
+
+struct iperf_packet {
+    uint32_t packet_id;         // Packet sequence number
+    uint32_t tv_sec;           // Timestamp seconds
+    uint32_t tv_usec;          // Timestamp microseconds
+    char data[IPERF_PACKET_SIZE - 12];  // Actual data
+};
 #pragma pack(pop)
 
 typedef struct {
     char public_ip[INET_ADDRSTRLEN];
     uint16_t public_port;
 } PublicEndpoint;
+
+// Test statistics structure
+struct test_stats {
+    uint64_t total_bytes;
+    uint32_t total_packets;
+    struct timeval start_time;
+    struct timeval last_report;
+};
+
 
 void generate_transaction_id(uint8_t *transaction_id) {
     for (int i = 0; i < 12; i++) {
@@ -166,7 +179,7 @@ int perform_nat_punching(int sock, struct sockaddr_in *peer_addr) {
     struct sockaddr_in recv_addr;
     socklen_t addr_len = sizeof(recv_addr);
     char buffer[BUFFER_SIZE];
-    
+
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -185,7 +198,7 @@ int perform_nat_punching(int sock, struct sockaddr_in *peer_addr) {
                                (struct sockaddr*)&recv_addr, &addr_len);
 
         if (recv_len > 0) {
-            printf("Received from %s:%d - %s\n", 
+            printf("Received from %s:%d - %s\n",
                    inet_ntoa(recv_addr.sin_addr),
                    ntohs(recv_addr.sin_port),
                    buffer);
@@ -208,79 +221,97 @@ int perform_nat_punching(int sock, struct sockaddr_in *peer_addr) {
     return -1;
 }
 
-// iperf 실행 및 결과 파싱을 위한 함수들
-void start_iperf_server(int port) {
-    char command[256];
-    snprintf(command, sizeof(command), IPERF_SERVER, port);
-    
-    pid_t pid = fork();
-    if (pid == 0) {  // 자식 프로세스
-        // 표준 출력을 /dev/null로 리다이렉트
-        int devnull = open("/dev/null", O_WRONLY);
-        dup2(devnull, STDOUT_FILENO);
-        dup2(devnull, STDERR_FILENO);
-        close(devnull);
-        
-        // iperf 서버 실행
-        system(command);
-        exit(0);
-    }
+void init_test_stats(struct test_stats *stats) {
+    stats->total_bytes = 0;
+    stats->total_packets = 0;
+    gettimeofday(&stats->start_time, NULL);
+    stats->last_report = stats->start_time;
 }
 
-void stop_iperf_server() {
-    system("pkill -f 'iperf3 -s'");
+void print_stats(struct test_stats *stats, struct timeval *current_time) {
+    double elapsed = (current_time->tv_sec - stats->last_report.tv_sec) +
+                    (current_time->tv_usec - stats->last_report.tv_usec) / 1000000.0;
+    double total_elapsed = (current_time->tv_sec - stats->start_time.tv_sec) +
+                          (current_time->tv_usec - stats->start_time.tv_usec) / 1000000.0;
+
+    double bits_per_second = (stats->total_bytes * 8.0) / elapsed;
+
+    printf("[%.1f-%.1f sec] %lu bytes %.2f Mbits/sec\n",
+           total_elapsed - 1.0, total_elapsed,
+           stats->total_bytes,
+           bits_per_second / 1000000.0);
+
+    stats->total_bytes = 0;
+    stats->last_report = *current_time;
 }
 
-void parse_iperf_result(const char* result) {
-    char *sender_ptr = strstr(result, "\"sender\"");
-    char *receiver_ptr = strstr(result, "\"receiver\"");
-    
-    if (sender_ptr && receiver_ptr) {
-        char *bits_per_second_sender = strstr(sender_ptr, "\"bits_per_second\":");
-        char *bits_per_second_receiver = strstr(receiver_ptr, "\"bits_per_second\":");
-        
-        if (bits_per_second_sender && bits_per_second_receiver) {
-            double sender_bps, receiver_bps;
-            sscanf(bits_per_second_sender + 18, "%lf", &sender_bps);
-            sscanf(bits_per_second_receiver + 18, "%lf", &receiver_bps);
-            
-            printf("\nSpeed Test Results:\n");
-            printf("Sender: %.2f Mbps\n", sender_bps / 1000000.0);
-            printf("Receiver: %.2f Mbps\n", receiver_bps / 1000000.0);
+void run_iperf_server(int sock, struct sockaddr_in *peer_addr) {
+    struct iperf_packet packet;
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    struct test_stats stats;
+    struct timeval current_time;
+
+    printf("Running in server mode...\n");
+    init_test_stats(&stats);
+
+    while (1) {
+        ssize_t recv_len = recvfrom(sock, &packet, sizeof(packet), 0,
+                                  (struct sockaddr*)&client_addr, &addr_len);
+
+        if (recv_len > 0) {
+            gettimeofday(&current_time, NULL);
+            stats.total_bytes += recv_len;
+            stats.total_packets++;
+
+            if (current_time.tv_sec >= stats.last_report.tv_sec + REPORT_INTERVAL) {
+                print_stats(&stats, &current_time);
+            }
         }
     }
 }
 
-void perform_iperf_test(const char* peer_ip, int port, int is_server) {
-    char command[256];
-    char result[IPERF_RESULT_BUFFER];
-    FILE *fp;
-    
-    if (is_server) {
-        printf("Starting iperf server...\n");
-        start_iperf_server(port);
-        sleep(2);  // 서버가 시작될 때까지 대기
-    } else {
-        printf("Running iperf client test...\n");
-        snprintf(command, sizeof(command), IPERF_CLIENT, peer_ip, port, IPERF_DURATION);
-        
-        fp = popen(command, "r");
-        if (fp == NULL) {
-            printf("Failed to run iperf client\n");
-            return;
+void run_iperf_client(int sock, struct sockaddr_in *peer_addr) {
+    struct iperf_packet packet;
+    struct test_stats stats;
+    struct timeval current_time;
+    uint32_t packet_id = 0;
+
+    printf("Running in client mode...\n");
+    printf("Sending %d byte packets for %d seconds\n", IPERF_PACKET_SIZE, TEST_DURATION);
+
+    init_test_stats(&stats);
+    memset(&packet, 'a', sizeof(packet));
+
+    while (1) {
+        gettimeofday(&current_time, NULL);
+
+        if (current_time.tv_sec >= stats.start_time.tv_sec + TEST_DURATION) {
+            break;
         }
-        
-        size_t total_read = 0;
-        size_t bytes_read;
-        while ((bytes_read = fread(result + total_read, 1, 
-               IPERF_RESULT_BUFFER - total_read - 1, fp)) > 0) {
-            total_read += bytes_read;
+
+        packet.packet_id = htonl(packet_id++);
+        packet.tv_sec = htonl(current_time.tv_sec);
+        packet.tv_usec = htonl(current_time.tv_usec);
+
+        ssize_t sent_len = sendto(sock, &packet, sizeof(packet), 0,
+                                (struct sockaddr*)peer_addr, sizeof(*peer_addr));
+
+        if (sent_len > 0) {
+            stats.total_bytes += sent_len;
+            stats.total_packets++;
+
+            if (current_time.tv_sec >= stats.last_report.tv_sec + REPORT_INTERVAL) {
+                print_stats(&stats, &current_time);
+            }
         }
-        result[total_read] = '\0';
-        
-        pclose(fp);
-        parse_iperf_result(result);
+
+        usleep(1000);  // 1ms delay
     }
+
+    gettimeofday(&current_time, NULL);
+    print_stats(&stats, &current_time);
+    printf("\nTest completed. Sent %u packets\n", stats.total_packets);
 }
 
 int main(int argc, char *argv[]) {
@@ -321,11 +352,11 @@ int main(int argc, char *argv[]) {
     char buffer[BUFFER_SIZE];
     struct sockaddr_in peer_addr;
     socklen_t peer_addr_len = sizeof(peer_addr);
-    
+
     printf("Enter peer's public IP and port (format: IP:PORT): ");
     char peer_info[64];
     fgets(peer_info, sizeof(peer_info), stdin);
-    
+
     char peer_ip[INET_ADDRSTRLEN];
     int peer_port;
     sscanf(peer_info, "%[^:]:%d", peer_ip, &peer_port);
@@ -343,15 +374,14 @@ int main(int argc, char *argv[]) {
 
     printf("P2P connection established. Starting chat...\n");
     printf("Commands:\n");
-    printf("  /iperf server - Start iperf server\n");
-    printf("  /iperf client - Start iperf client test\n");
-    printf("  /quit - Exit the program\n");
+    printf("  /iperf server - Start iperf server mode\n");
+    printf("  /iperf client - Start iperf client mode\n");
+    printf("  /quit - Exit program\n");
 
     fd_set readfds;
     struct timeval tv;
     time_t last_activity = time(NULL);
-    int iperf_server_running = 0;
-    
+
     while (1) {
         FD_ZERO(&readfds);
         FD_SET(STDIN_FILENO, &readfds);
@@ -373,27 +403,22 @@ int main(int argc, char *argv[]) {
             memset(buffer, 0, BUFFER_SIZE);
             fgets(buffer, BUFFER_SIZE, stdin);
 
-            // 명령어 처리
             if (strncmp(buffer, "/iperf server", 12) == 0) {
-                perform_iperf_test(NULL, IPERF_PORT, 1);
-                iperf_server_running = 1;
-                printf("Iperf server started on port %d\n", IPERF_PORT);
-                continue;
+                printf("Starting iperf server mode...\n");
+                run_iperf_server(sock, &peer_addr);
             }
             else if (strncmp(buffer, "/iperf client", 12) == 0) {
-                perform_iperf_test(peer_ip, IPERF_PORT, 0);
-                continue;
+                printf("Starting iperf client mode...\n");
+                run_iperf_client(sock, &peer_addr);
             }
             else if (strncmp(buffer, "/quit", 5) == 0) {
-                if (iperf_server_running) {
-                    stop_iperf_server();
-                }
                 break;
             }
-
-            if (sendto(sock, buffer, strlen(buffer), 0,
-                      (struct sockaddr*)&peer_addr, sizeof(peer_addr)) < 0) {
-                perror("Send failed");
+            else {
+                if (sendto(sock, buffer, strlen(buffer), 0,
+                          (struct sockaddr*)&peer_addr, sizeof(peer_addr)) < 0) {
+                    perror("Send failed");
+                }
             }
             last_activity = current_time;
         }
@@ -422,10 +447,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (iperf_server_running) {
-        stop_iperf_server();
-    }
-    
     close(sock);
     return 0;
 }
+
